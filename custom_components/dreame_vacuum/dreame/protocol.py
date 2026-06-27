@@ -972,7 +972,7 @@ class DreameVacuumMiHomeCloudProtocol:
                     "Content-Type": "application/x-www-form-urlencoded",
                 },
                 cookies={"deviceId": self._client_id},
-                timeout=120,
+                timeout=10,
             )
             if response is not None:
                 if response.status_code == 200:
@@ -1020,7 +1020,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 data=data,
                 params=params,
                 cookies=cookies,
-                timeout=120,
+                timeout=10,
             )
             if response is not None:
                 if response.status_code == 200:
@@ -1068,7 +1068,7 @@ class DreameVacuumMiHomeCloudProtocol:
                     "User-Agent": self._useragent,
                     "Content-Type": "application/x-www-form-urlencoded",
                 },
-                timeout=120,
+                timeout=10,
             )
             if response is not None:
                 if response.status_code == 200 and "serviceToken" in response.cookies:
@@ -1106,7 +1106,7 @@ class DreameVacuumMiHomeCloudProtocol:
             r = s.get(
                 "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true",
                 headers={"User-Agent": self._useragent, "Content-Type": "application/x-www-form-urlencoded"},
-                timeout=120,
+                timeout=10,
             )
             if r is None or r.status_code != 200:
                 return False
@@ -1118,7 +1118,7 @@ class DreameVacuumMiHomeCloudProtocol:
             ssecurity = data.get("ssecurity", self._ssecurity)
             location = data.get("location")
             new_pt = data.get("passToken") or s.cookies.get("passToken") or self._pass_token
-            r2 = s.get(location, headers={"User-Agent": self._useragent}, timeout=120)
+            r2 = s.get(location, headers={"User-Agent": self._useragent}, timeout=10)
             service_token = s.cookies.get("serviceToken")
             if r2 is not None and r2.status_code == 200 and service_token:
                 self._userId = user_id
@@ -1178,7 +1178,7 @@ class DreameVacuumMiHomeCloudProtocol:
                     response = self._session.get(
                         "https://account.xiaomi.com/identity/list",
                         params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
-                        timeout=120,
+                        timeout=10,
                     )
                     if response and response.status_code == 200:
                         identity_session = response.cookies.get("identity_session")
@@ -1204,7 +1204,7 @@ class DreameVacuumMiHomeCloudProtocol:
                                     "mask": "0",
                                     "_locale": str(self._locale),
                                 },
-                                timeout=120,
+                                timeout=10,
                             )
                             if not verify_response or verify_response.status_code != 200:
                                 return False
@@ -1243,7 +1243,7 @@ class DreameVacuumMiHomeCloudProtocol:
                                     "_json": "true",
                                     "ick": self._session.cookies.get("ick", ""),
                                 },
-                                timeout=120,
+                                timeout=10,
                             )
                             if not send_response or send_response.status_code != 200:
                                 return False
@@ -1294,7 +1294,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 "https://account.xiaomi.com/identity/list",
                 params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
                 headers=headers,
-                timeout=120,
+                timeout=10,
             )
             if response is None:
                 _LOGGER.error(f"2FA failed: identity/list endpoint failed!")
@@ -1377,7 +1377,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
                 headers=headers,
                 allow_redirects=False,
-                timeout=120,
+                timeout=10,
             )
 
             if response is None:
@@ -1468,7 +1468,7 @@ class DreameVacuumMiHomeCloudProtocol:
             retry_count = 0
         while retries < retry_count + 1:
             try:
-                response = self._session.get(url, timeout=120)
+                response = self._session.get(url, timeout=10)
             except Exception as ex:
                 response = None
                 _LOGGER.warning("Unable to get file at %s: %s", url, ex)
@@ -1700,7 +1700,7 @@ class DreameVacuumMiHomeCloudProtocol:
             return None
         return api_response["result"]
 
-    def request(self, url: str, params: Dict[str, str], retry_count=5, timeout=None) -> Any:
+    def request(self, url: str, params: Dict[str, str], retry_count=2, timeout=None) -> Any:
         retries = 0
         if not retry_count or retry_count < 0:
             retry_count = 0
@@ -1729,7 +1729,7 @@ class DreameVacuumMiHomeCloudProtocol:
         while retries < retry_count + 1:
             try:
                 response = self._session.post(
-                    url, headers=headers, cookies=cookies, data=fields, timeout=timeout if timeout else 120
+                    url, headers=headers, cookies=cookies, data=fields, timeout=timeout if timeout else 6
                 )
                 break
             except Exception as ex:
@@ -1737,8 +1737,6 @@ class DreameVacuumMiHomeCloudProtocol:
                 response = None
                 if self._connected:
                     _LOGGER.warning("Error while executing request (try %s/%s): %s %s", retries, retry_count + 1, url, str(ex))
-                if retries < retry_count + 1:
-                    sleep(min(2 * retries, 10))
 
         # Distinguish a true network timeout (no response at all) from a server
         # response (incl. non-200 auth rejection). Used by check_login to decide
