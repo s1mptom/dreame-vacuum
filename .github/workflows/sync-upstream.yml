@@ -15,11 +15,24 @@ name: sync-upstream
 # issue.
 #
 # Versioning: upstream ships v2.0.0bNN. We never reuse those tags — the repo manifest
-# is kept byte-identical to upstream (so merges never conflict on the version line)
-# and the fork version is stamped into the release zip only, as a 4th segment:
-# v2.0.0b25.1, v2.0.0b25.2, ... It sorts above the upstream tag it is built on
-# (2.0.0b25 < 2.0.0b25.1) and below upstream's next one (2.0.0b25.1 < 2.0.0b26), so a
-# future upstream release is still offered by HACS instead of being shadowed.
+# is kept byte-identical to upstream (so merges never conflict on the version line) and
+# the fork version is written into the release zip only. Two different shapes, because
+# the tag and the manifest are read by two consumers with incompatible rules:
+#
+#   tag       v2.0.0b25.N       AwesomeVersion calls this UNKNOWN, so HACS'
+#                               version_left_higher_then_right() returns None and
+#                               pending_update falls back to `installed != available`.
+#                               That fallback is what we want: it always notices a new
+#                               release. A PEP440-shaped tag would be *compared*, and
+#                               AwesomeVersion evaluates 2.0.0b26.post1 > 2.0.0b25.post9
+#                               as False — after an upstream bump HACS would silently
+#                               stop offering updates.
+#   manifest  v2.0.0b25.postN   Home Assistant validates the manifest version and
+#                               refuses to load the integration otherwise ("does not
+#                               have a valid version key"). 4-segment betas are rejected;
+#                               .postN is valid PEP440. HACS never reads this field for
+#                               comparisons (installed_version is the tag), so the odd
+#                               ordering of .post carries no risk here.
 #
 # Releases are prereleases, matching upstream's 2.x betas — HACS only shows them with
 # "Show beta versions" enabled on the repository, and it never installs by itself.
@@ -99,6 +112,7 @@ jobs:
         if: steps.merge.outputs.integration_changed == 'true' || inputs.force_release
         run: |
           set -euo pipefail
+          python3 -m pip install --quiet awesomeversion
 
           # Upstream's own version, verbatim from the (unmodified) repo manifest.
           U=$(python3 -c 'import json;print(json.load(open("custom_components/'"$DOMAIN"'/manifest.json"))["version"].lstrip("v"))')
@@ -107,17 +121,34 @@ jobs:
           N=1
           while gh release view "v${U}.${N}" >/dev/null 2>&1; do N=$((N + 1)); done
           TAG="v${U}.${N}"
-          echo "Releasing $TAG (upstream $U)"
+          MANIFEST_VERSION="v${U}.post${N}"
+          echo "Releasing $TAG (upstream $U, manifest $MANIFEST_VERSION)"
 
           # HACS zip_release: the archive root IS the integration folder's content.
           rm -rf build && mkdir build
           cp -R "custom_components/$DOMAIN/." build/
           find build -name __pycache__ -type d -prune -exec rm -rf {} +
-          python3 - "$TAG" <<'PY'
+          python3 - "$MANIFEST_VERSION" <<'PY'
           import json, sys
+          from awesomeversion import AwesomeVersion, AwesomeVersionStrategy
+
+          version = sys.argv[1]
+          # Same check Home Assistant runs on custom integrations at startup. Failing
+          # here costs a red workflow; failing there costs a silently dead integration.
+          AwesomeVersion(
+              version,
+              ensure_strategy=[
+                  AwesomeVersionStrategy.CALVER,
+                  AwesomeVersionStrategy.SEMVER,
+                  AwesomeVersionStrategy.SIMPLEVER,
+                  AwesomeVersionStrategy.BUILDVER,
+                  AwesomeVersionStrategy.PEP440,
+              ],
+          )
+
           p = "build/manifest.json"
           d = json.load(open(p))
-          d["version"] = sys.argv[1]
+          d["version"] = version
           json.dump(d, open(p, "w"), indent=2)
           PY
           (cd build && zip -qr "../$DOMAIN.zip" .)
