@@ -824,6 +824,8 @@ class DreameVacuumMiHomeCloudProtocol:
         self._captcha_code = None
         self._logged_in = False
         self._auth_failed = False
+        self._last_timeout = False
+        self._last_auth_error = False
         self._uid = None
         self._did = device_id
         self._client_id = DreameVacuumMiHomeCloudProtocol.generate_client_id()
@@ -954,10 +956,13 @@ class DreameVacuumMiHomeCloudProtocol:
             #    timeout): treat as auth failure (return False) so login() proceeds to
             #    refresh_token()/full re-login.
             if self_check:
-                if getattr(self, "_last_timeout", False):
+                if self._last_timeout:
                     _LOGGER.debug("check_login: network timeout — keeping cached session, skipping re-login")
                     return True
-                _LOGGER.debug("check_login: server rejected token (non-200) — treating as auth failure")
+                _LOGGER.debug(
+                    "check_login: server rejected token (%s) — treating as auth failure",
+                    "expired/invalid token" if self._last_auth_error else "non-200",
+                )
                 return False
         except:
             pass
@@ -1742,6 +1747,7 @@ class DreameVacuumMiHomeCloudProtocol:
         # response (incl. non-200 auth rejection). Used by check_login to decide
         # whether to keep the cached session (timeout) or treat it as auth failure.
         self._last_timeout = response is None
+        self._last_auth_error = False
 
         if response is not None:
             if response.status_code == 200:
@@ -1750,6 +1756,21 @@ class DreameVacuumMiHomeCloudProtocol:
                 decoded = self.decrypt_rc4(self.signed_nonce(fields["_nonce"]), response.text)
                 return json.loads(decoded) if decoded else None
             _LOGGER.warning("Execute api call failed with response: %s", response.text)
+            # An expired/revoked serviceToken comes back as a non-200 body (e.g.
+            # {"code":0,"message":"SERVICETOKEN_EXPIRED"}), so request() returns None and the
+            # callers - which only inspect a decoded response - would never notice. Invalidate
+            # the session here so the next update cycle runs login() -> refresh_token()
+            # (silent passToken re-login) instead of retrying the dead token forever.
+            text = response.text or ""
+            if (
+                response.status_code in (401, 403)
+                or "SERVICETOKEN_EXPIRED" in text
+                or "auth err" in text
+                or "invalid signature" in text
+            ):
+                self._last_auth_error = True
+                self._logged_in = False
+                self._auth_failed = True
 
         if self._fail_count == 5:
             self._connected = False
