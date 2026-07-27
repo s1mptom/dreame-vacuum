@@ -1,0 +1,130 @@
+name: sync-upstream
+
+# Keeps this fork's `dev` branch equal to "upstream dev + our patches" and publishes
+# a HACS-installable release whenever the integration actually changed.
+#
+# Why a schedule and not a trigger on upstream commits: GitHub only delivers events
+# for THIS repo. Upstream (Tasshack/dreame-vacuum) is a different repo we don't own,
+# so we poll. A run that finds nothing new exits in a few seconds.
+#
+# Why merge and not "reset to upstream + re-apply patches with sed": our patch is a
+# real ~130-line change to dreame/protocol.py (silent passToken re-login + expired
+# serviceToken detection), not a substitution. A merge keeps it as history and tells
+# us honestly when upstream touches the same lines — that is exactly when a human
+# must look. On conflict the workflow aborts the merge, pushes nothing, and opens an
+# issue.
+#
+# Versioning: upstream ships v2.0.0bNN. We never reuse those tags — the repo manifest
+# is kept byte-identical to upstream (so merges never conflict on the version line)
+# and the fork version is stamped into the release zip only, as a 4th segment:
+# v2.0.0b25.1, v2.0.0b25.2, ... It sorts above the upstream tag it is built on
+# (2.0.0b25 < 2.0.0b25.1) and below upstream's next one (2.0.0b25.1 < 2.0.0b26), so a
+# future upstream release is still offered by HACS instead of being shadowed.
+#
+# Releases are prereleases, matching upstream's 2.x betas — HACS only shows them with
+# "Show beta versions" enabled on the repository, and it never installs by itself.
+
+on:
+  schedule:
+    - cron: "20 4 * * *" # daily 04:20 UTC
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Cut a release even if upstream brought nothing new"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: https://github.com/Tasshack/dreame-vacuum.git
+      UPSTREAM_BRANCH: dev
+      BRANCH: dev
+      DOMAIN: dreame_vacuum
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }} # pin gh to THIS fork; we add an 'upstream' remote
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM" 2>/dev/null || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor upstream/$UPSTREAM_BRANCH HEAD; then
+            echo "::notice::Already contains upstream/$UPSTREAM_BRANCH — nothing to merge."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "integration_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE=$(git rev-parse HEAD)
+
+          if ! git merge --no-edit upstream/$UPSTREAM_BRANCH; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            git merge --abort || true
+            echo "::error::Merge conflict with upstream — nothing pushed."
+            TITLE="Upstream sync conflict ($(date -u +%Y-%m-%d))"
+            if ! gh issue list --state open --search "$TITLE in:title" --json title -q '.[].title' | grep -qF "$TITLE"; then
+              gh issue create --title "$TITLE" --body "$(printf 'Automatic merge of `upstream/%s` into `%s` hit a conflict, so nothing was pushed and no release was cut. This fork is still on its previous commit and HA keeps running the version it has.\n\nConflicting files:\n%s\n\nResolve locally:\n```\ngit fetch upstream %s\ngit checkout %s\ngit merge upstream/%s\n```\nOur patch lives in `custom_components/dreame_vacuum/dreame/protocol.py` (silent passToken re-login + SERVICETOKEN_EXPIRED detection). Once merged and pushed, run this workflow with `force_release` to publish.' "$UPSTREAM_BRANCH" "$BRANCH" "$CONFLICTS" "$UPSTREAM_BRANCH" "$BRANCH" "$UPSTREAM_BRANCH")"
+            fi
+            exit 1
+          fi
+
+          git push origin HEAD:"$BRANCH"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+          # Docs-only upstream churn should not produce a release nobody needs.
+          if git diff --quiet "$BEFORE" HEAD -- "custom_components/$DOMAIN"; then
+            echo "::notice::Upstream changed nothing under custom_components/$DOMAIN — no release."
+            echo "integration_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "integration_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package and release
+        if: steps.merge.outputs.integration_changed == 'true' || inputs.force_release
+        run: |
+          set -euo pipefail
+
+          # Upstream's own version, verbatim from the (unmodified) repo manifest.
+          U=$(python3 -c 'import json;print(json.load(open("custom_components/'"$DOMAIN"'/manifest.json"))["version"].lstrip("v"))')
+
+          # First free 4th segment for this upstream version.
+          N=1
+          while gh release view "v${U}.${N}" >/dev/null 2>&1; do N=$((N + 1)); done
+          TAG="v${U}.${N}"
+          echo "Releasing $TAG (upstream $U)"
+
+          # HACS zip_release: the archive root IS the integration folder's content.
+          rm -rf build && mkdir build
+          cp -R "custom_components/$DOMAIN/." build/
+          find build -name __pycache__ -type d -prune -exec rm -rf {} +
+          python3 - "$TAG" <<'PY'
+          import json, sys
+          p = "build/manifest.json"
+          d = json.load(open(p))
+          d["version"] = sys.argv[1]
+          json.dump(d, open(p, "w"), indent=2)
+          PY
+          (cd build && zip -qr "../$DOMAIN.zip" .)
+
+          gh release create "$TAG" \
+            --prerelease \
+            --target "$(git rev-parse HEAD)" \
+            --title "$TAG" \
+            --notes "Fork of Tasshack/dreame-vacuum \`$U\` with the Mi Home cloud session fix (silent passToken re-login, expired serviceToken detected instead of looping). Built automatically by \`sync-upstream\`." \
+            "$DOMAIN.zip"
