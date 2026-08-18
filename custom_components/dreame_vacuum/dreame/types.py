@@ -2433,6 +2433,30 @@ DISCARDED_PROPERTIES: Final = [
 ]
 
 
+# Properties the cloud answers from its own cache instead of waking the vacuum, i.e. the
+# ones that came back with net_cost == 0 in a capture of the Mi Home app (xiaomi.vacuum.c102cn).
+# This is only a starting guess: the device object re-classifies properties at runtime from
+# the net_cost the cloud reports, so a model that keeps these on the robot corrects itself.
+CLOUD_CACHED_PROPERTIES: Final = [
+    DreameVacuumProperty.SERIAL_NUMBER,
+    DreameVacuumProperty.CLEANING_MODE,
+    DreameVacuumProperty.AUTO_ADD_DETERGENT,
+    DreameVacuumProperty.DRYING_TIME,
+    DreameVacuumProperty.MOP_WASH_LEVEL,
+    DreameVacuumProperty.AUTO_SWITCH_SETTINGS,
+    DreameVacuumProperty.AUTO_WATER_REFILLING,
+    DreameVacuumProperty.WATER_CHECK,
+    DreameVacuumProperty.MESSAGE_PROMPT,
+    DreameVacuumProperty.MULTI_FLOOR_MAP,
+    DreameVacuumProperty.SCHEDULE_CANCEL_REASON,
+    DreameVacuumProperty.PET_CRUISE_SCHEDULE,
+    DreameVacuumProperty.AUTO_DUST_COLLECTING,
+    DreameVacuumProperty.AUTO_EMPTY_FREQUENCY,
+    DreameVacuumProperty.DUST_COLLECTION,
+    DreameVacuumProperty.AUTO_EMPTY_STATUS,
+]
+
+
 READ_ONLY_PROPERTIES: Final = [
     DreameVacuumProperty.STATE,
     DreameVacuumProperty.ERROR,

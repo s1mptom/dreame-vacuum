@@ -8,7 +8,8 @@ import requests
 import zlib
 import ssl
 import queue
-from threading import Thread, Timer
+from threading import Thread, Timer, Lock, local as thread_local
+from concurrent.futures import ThreadPoolExecutor
 from time import sleep
 import time, locale
 import paho.mqtt
@@ -34,6 +35,16 @@ DREAME_STRINGS: Final = (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Mi Home 11.7.623 no longer logs in under the "xiaomiio" sid: it uses "mijia", takes its
+# serviceToken from sts.api.mijia.tech and talks to api.mijia.tech, calling rpc without the
+# "v2/" prefix. A serviceToken is minted per sid, so login, STS callback and api host have to
+# move together - they cannot be mixed. Set this to False to go back to the older path.
+MI_HOME_APP_API: Final = True
+
+# Only the Chinese mainland front end was observed. The names of the regional ones (if any)
+# are unknown, so every other country keeps the api.io.mi.com path until measured.
+MI_HOME_APP_API_COUNTRIES: Final = ("cn",)
 
 
 class DreameVacuumDeviceProtocol(MiIOProtocol):
@@ -822,6 +833,7 @@ class DreameVacuumMiHomeCloudProtocol:
         self._pass_token = None
         self._captcha_ick = None
         self._captcha_code = None
+        self._cuser_id = None
         self._logged_in = False
         self._auth_failed = False
         self._last_timeout = False
@@ -849,6 +861,29 @@ class DreameVacuumMiHomeCloudProtocol:
         self.captcha_img = None
         self._fail_count = 0
         self._connected = False
+        self.last_net_cost = None  # net_cost of the last rpc call (0 = served from cloud cache)
+        # Mi Home keeps two rpc calls in flight instead of chaining them. requests.Session is
+        # not thread safe, so parallel workers get their own persistent session; the pool
+        # threads are reused, which keeps the TLS connection alive between update cycles.
+        self._executor = None
+        self._worker_sessions = thread_local()
+        # serviceToken and ssecurity are rotated together, so only one thread may refresh them
+        self._auth_lock = Lock()
+
+        # Which of the two Xiaomi front ends this session talks to (see MI_HOME_APP_API)
+        self._app_api = MI_HOME_APP_API and country in MI_HOME_APP_API_COUNTRIES
+        if self._app_api:
+            self._sid = "mijia"
+            self._sts_url = "https://sts.api.mijia.tech/mijia/sts"
+            self._api_url = "https://api.mijia.tech/app"
+            self._rpc_path = "home/rpc"
+        else:
+            self._sid = "xiaomiio"
+            self._sts_url = "https://sts.api.io.mi.com/sts"
+            self._api_url = f"https://{('' if country == 'cn' else (country + '.'))}api.io.mi.com/app"
+            self._rpc_path = "v2/home/rpc"
+            if MI_HOME_APP_API:
+                _LOGGER.debug("Country %s has no known mijia.tech front end, using api.io.mi.com", country)
         try:
             offset = (time.timezone if (time.localtime().tm_isdst == 0) else time.altzone) / 60 * -1
             self._timezone = "GMT{}{:02d}:{:02d}".format(
@@ -971,7 +1006,7 @@ class DreameVacuumMiHomeCloudProtocol:
     def login_step_1(self) -> bool:
         try:
             response = self._session.get(
-                "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true",
+                f"https://account.xiaomi.com/pass/serviceLogin?sid={self._sid}&_json=true",
                 headers={
                     "User-Agent": self._useragent,
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -986,6 +1021,7 @@ class DreameVacuumMiHomeCloudProtocol:
                     if data.get("code") == 0:
                         self._userId = data.get("userId", self._userId)
                         self._ssecurity = data.get("ssecurity", self._ssecurity)
+                        self._cuser_id = data.get("cUserId", self._cuser_id)
                         self._location = data.get("location")
                     return True
                 self._auth_failed = True
@@ -998,9 +1034,9 @@ class DreameVacuumMiHomeCloudProtocol:
         data = {
             "user": self._username,
             "hash": hashlib.md5(str.encode(self._password)).hexdigest().upper(),
-            "callback": "https://sts.api.io.mi.com/sts",
-            "sid": "xiaomiio",
-            "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
+            "callback": self._sts_url,
+            "sid": self._sid,
+            "qs": f"%3Fsid%3D{self._sid}%26_json%3Dtrue",
         }
         if self._sign:
             data["_sign"] = self._sign
@@ -1109,7 +1145,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 s.cookies.set("userId", str(self._userId), domain="xiaomi.com")
             s.cookies.set("passToken", self._pass_token, domain="xiaomi.com")
             r = s.get(
-                "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true",
+                f"https://account.xiaomi.com/pass/serviceLogin?sid={self._sid}&_json=true",
                 headers={"User-Agent": self._useragent, "Content-Type": "application/x-www-form-urlencoded"},
                 timeout=10,
             )
@@ -1121,6 +1157,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 return False
             user_id = data.get("userId", self._userId)
             ssecurity = data.get("ssecurity", self._ssecurity)
+            cuser_id = data.get("cUserId", self._cuser_id)
             location = data.get("location")
             new_pt = data.get("passToken") or s.cookies.get("passToken") or self._pass_token
             r2 = s.get(location, headers={"User-Agent": self._useragent}, timeout=10)
@@ -1128,6 +1165,7 @@ class DreameVacuumMiHomeCloudProtocol:
             if r2 is not None and r2.status_code == 200 and service_token:
                 self._userId = user_id
                 self._ssecurity = ssecurity
+                self._cuser_id = cuser_id
                 self._service_token = service_token
                 self._pass_token = new_pt
                 self._session = s
@@ -1182,7 +1220,7 @@ class DreameVacuumMiHomeCloudProtocol:
 
                     response = self._session.get(
                         "https://account.xiaomi.com/identity/list",
-                        params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
+                        params={"sid": self._sid, "context": context, "_locale": str(self._locale)},
                         timeout=10,
                     )
                     if response and response.status_code == 200:
@@ -1204,7 +1242,7 @@ class DreameVacuumMiHomeCloudProtocol:
                                 params={
                                     "_flag": flag,
                                     "_json": "true",
-                                    "sid": "xiaomiio",
+                                    "sid": self._sid,
                                     "context": context,
                                     "mask": "0",
                                     "_locale": str(self._locale),
@@ -1237,7 +1275,7 @@ class DreameVacuumMiHomeCloudProtocol:
                                 cookies={"identity_session": identity_session},
                                 params={
                                     "_dc": str(int(time.time() * 1000)),
-                                    "sid": "xiaomiio",
+                                    "sid": self._sid,
                                     "context": context,
                                     "mask": "0",
                                     "_locale": str(self._locale),
@@ -1297,7 +1335,7 @@ class DreameVacuumMiHomeCloudProtocol:
 
             response = self._session.get(
                 "https://account.xiaomi.com/identity/list",
-                params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
+                params={"sid": self._sid, "context": context, "_locale": str(self._locale)},
                 headers=headers,
                 timeout=10,
             )
@@ -1331,7 +1369,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 params={
                     "_flag": flag,
                     "_json": "true",
-                    "sid": "xiaomiio",
+                    "sid": self._sid,
                     "context": context,
                     "mask": "0",
                     "_locale": str(self._locale),
@@ -1379,7 +1417,7 @@ class DreameVacuumMiHomeCloudProtocol:
 
             response = self._session.get(
                 "https://account.xiaomi.com/identity/result/check",
-                params={"sid": "xiaomiio", "context": context, "_locale": str(self._locale)},
+                params={"sid": self._sid, "context": context, "_locale": str(self._locale)},
                 headers=headers,
                 allow_redirects=False,
                 timeout=10,
@@ -1417,7 +1455,10 @@ class DreameVacuumMiHomeCloudProtocol:
 
             location_url = response.headers.get("Location")
             if not location_url and response.text:
-                match = re.search(r'(https://[a-zA-Z0-9-]*\.?sts\.api\.io\.mi\.com/sts[^"\'\s]*)', response.text)
+                # The STS host follows the sid: sts.api.io.mi.com for xiaomiio,
+                # sts.api.mijia.tech for the sid the app uses.
+                sts_host = re.escape(urlparse(self._sts_url).netloc)
+                match = re.search(rf'(https://[a-zA-Z0-9-]*\.?{sts_host}/[^"\'\s]*)', response.text)
                 if match:
                     location_url = match.group(1)
 
@@ -1434,7 +1475,7 @@ class DreameVacuumMiHomeCloudProtocol:
                 return False
 
             self._service_token = self._session.cookies.get(
-                "serviceToken", domain=".sts.api.io.mi.com"
+                "serviceToken", domain=f".{urlparse(self._sts_url).netloc}"
             ) or self._session.cookies.get("serviceToken")
 
             for c in self._session.cookies:
@@ -1446,7 +1487,12 @@ class DreameVacuumMiHomeCloudProtocol:
                 _LOGGER.error("2FA failed: Missing 'serviceToken' or 'userId' after STS connection.")
                 return False
 
-            for d in [".api.io.mi.com", ".io.mi.com", ".mi.com"]:
+            api_host = urlparse(self._api_url).netloc
+            domains = [".api.io.mi.com", ".io.mi.com", ".mi.com"] if not self._app_api else [
+                f".{api_host}",
+                ".mijia.tech",
+            ]
+            for d in domains:
                 self._session.cookies.set("serviceToken", self._service_token, domain=d)
                 self._session.cookies.set("yetAnotherServiceToken", self._service_token, domain=d)
 
@@ -1519,13 +1565,70 @@ class DreameVacuumMiHomeCloudProtocol:
             retry_count,
         )
 
-    def send(self, method, parameters, retry_count: int = 2, timeout=None) -> Any:
+    def _send_with_cost(self, method, parameters, retry_count: int = 2, timeout=None) -> Tuple[Any, Any]:
+        """Send an rpc call and return (result, net_cost).
+
+        The cloud reports how long the call took to reach the device: net_cost == 0 means it
+        was answered from the cloud's own cache without waking the vacuum. Mi Home uses that
+        to keep its cached properties in a separate, effectively free batch.
+        """
         api_response = self._api_call(
-            f"v2/home/rpc/{self._did}", {"method": method, "params": parameters}, retry_count, timeout
+            f"{self._rpc_path}/{self._did}", {"method": method, "params": parameters}, retry_count, timeout
         )
         if api_response is None or "result" not in api_response:
-            return None
-        return api_response["result"]
+            return None, None
+        return api_response["result"], api_response.get("net_cost")
+
+    def send(self, method, parameters, retry_count: int = 2, timeout=None) -> Any:
+        result, net_cost = self._send_with_cost(method, parameters, retry_count, timeout)
+        self.last_net_cost = net_cost
+        return result
+
+    def _request_session(self):
+        """Session to use on the calling thread.
+
+        Auth state does not live in the session (cookies are built per request), so a worker
+        thread can safely use its own. Only pool threads get a private session; every other
+        caller keeps the main one so its keep-alive connection is reused.
+        """
+        session = getattr(self._worker_sessions, "session", None)
+        return session if session is not None else self._session
+
+    def _init_worker_session(self):
+        self._worker_sessions.session = requests.session()
+
+    def send_batches(self, method, batches, retry_count: int = 1, timeout=None) -> list:
+        """Run several rpc calls concurrently, the way the app does (two in flight).
+
+        Returns one (result, net_cost) tuple per batch; a failed batch yields (None, None)
+        instead of aborting the others.
+        """
+        batches = [batch for batch in batches if batch]
+        if not batches:
+            return []
+        if len(batches) == 1:
+            return [self._send_with_cost(method, batches[0], retry_count, timeout)]
+
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="dreame-rpc",
+                initializer=self._init_worker_session,
+            )
+
+        futures = [
+            self._executor.submit(self._send_with_cost, method, batch, retry_count, timeout) for batch in batches
+        ]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as ex:  # noqa: BLE001 - one bad batch must not kill the rest
+                _LOGGER.debug("Parallel rpc batch failed: %s", ex)
+                results.append((None, None))
+        if results:
+            self.last_net_cost = results[0][1]
+        return results
 
     def get_device_property(self, key, limit=1, time_start=0, time_end=9999999999):
         return self.get_device_data(key, "prop", limit, time_start, time_end)
@@ -1705,7 +1808,7 @@ class DreameVacuumMiHomeCloudProtocol:
             return None
         return api_response["result"]
 
-    def request(self, url: str, params: Dict[str, str], retry_count=2, timeout=None) -> Any:
+    def request(self, url: str, params: Dict[str, str], retry_count=2, timeout=None, _auth_retry=True) -> Any:
         retries = 0
         if not retry_count or retry_count < 0:
             retry_count = 0
@@ -1726,14 +1829,24 @@ class DreameVacuumMiHomeCloudProtocol:
             "dst_offset": str(time.localtime().tm_isdst * 60 * 60 * 1000),
             "channel": "MI_APP_STORE",
         }
+        # The app also identifies the account by cUserId and names the device and country it
+        # logged in from; sent whenever known so the request matches what the cloud expects.
+        if self._cuser_id:
+            cookies["cUserId"] = str(self._cuser_id)
+        if self._client_id:
+            cookies["PassportDeviceId"] = str(self._client_id)
+        if self._country:
+            cookies["countryCode"] = str(self._country).upper()
 
         nonce = self.generate_nonce()
         signed_nonce = self.signed_nonce(nonce)
         fields = self.generate_enc_params(url, "POST", signed_nonce, nonce, params, self._ssecurity)
+        token_before = self._service_token  # to tell "my token expired" from "someone renewed it"
 
+        session = self._request_session()
         while retries < retry_count + 1:
             try:
-                response = self._session.post(
+                response = session.post(
                     url, headers=headers, cookies=cookies, data=fields, timeout=timeout if timeout else 6
                 )
                 break
@@ -1772,6 +1885,26 @@ class DreameVacuumMiHomeCloudProtocol:
                 self._logged_in = False
                 self._auth_failed = True
 
+                # Mi Home does not wait for the next poll after a rejected token: it mints a
+                # fresh serviceToken from the stored passToken and immediately replays the
+                # request that failed. Do the same, once, so a rotated token costs one extra
+                # round trip instead of a whole update cycle (and an "unavailable" blip).
+                # ssecurity is rotated together with the token, so the request must be rebuilt
+                # from scratch - hence the recursive call rather than a retry of `fields`.
+                # With batches in flight several calls can be rejected at once; the lock keeps
+                # them from refreshing on top of each other and pairing a token with the wrong
+                # ssecurity - whoever loses the race simply replays with the new pair.
+                refreshed = False
+                if _auth_retry:
+                    with self._auth_lock:
+                        refreshed = self._service_token != token_before or self.refresh_token()
+                if refreshed:
+                    _LOGGER.debug("Token refreshed after auth error, replaying request")
+                    self._logged_in = True
+                    self._auth_failed = False
+                    self._last_auth_error = False
+                    return self.request(url, params, retry_count, timeout, _auth_retry=False)
+
         if self._fail_count == 5:
             self._connected = False
         else:
@@ -1779,7 +1912,7 @@ class DreameVacuumMiHomeCloudProtocol:
         return None
 
     def get_api_url(self) -> str:
-        return f"https://{('' if self._country == 'cn' else (self._country + '.'))}api.io.mi.com/app"
+        return self._api_url
 
     def signed_nonce(self, nonce: str) -> str:
         hash_object = hashlib.sha256(base64.b64decode(self._ssecurity) + base64.b64decode(nonce))
@@ -1790,6 +1923,9 @@ class DreameVacuumMiHomeCloudProtocol:
         self._connected = False
         self._logged_in = False
         self._auth_failed = False
+        if self._executor:
+            self._executor.shutdown(wait=False)
+            self._executor = None
         if self._thread:
             self._queue.put([])
 
@@ -1822,7 +1958,9 @@ class DreameVacuumMiHomeCloudProtocol:
     def generate_enc_signature(url, method: str, signed_nonce: str, params: Dict[str, str]) -> str:
         signature_params = [
             str(method).upper(),
-            url.split("com")[1].replace("/app/", "/"),
+            # Taken from the parsed URL rather than by splitting on "com": the app's host
+            # (api.mijia.tech) has no "com" in it and the old trick raises there.
+            urlparse(url).path.replace("/app/", "/", 1),
         ]
         for k, v in params.items():
             signature_params.append(f"{k}={v}")
@@ -2021,6 +2159,38 @@ class DreameVacuumProtocol:
 
     def get_properties(self, parameters: Any = None, retry_count: int = 1, timeout=None) -> Any:
         return self.send("get_properties", parameters=parameters, retry_count=retry_count, timeout=timeout)
+
+    def get_properties_batches(self, batches, retry_count: int = 1, timeout=None) -> list:
+        """Request several property batches at once and return (result, net_cost) per batch.
+
+        Mi Home never chains its property requests: it fires the cached batch and the device
+        batch together, so a poll costs one round trip instead of one per chunk. Only the Mi
+        Home cloud can do this (the local miIO socket and the Dreame cloud are sequential by
+        nature), everything else falls back to one call after another.
+        """
+        if (self.prefer_cloud or not self.device) and self.device_cloud:
+            if not self.device_cloud.logged_in:
+                # Same login path as send(), so batches never race ahead of authentication
+                self.device_cloud.login()
+                if self.device_cloud.logged_in and not self.device_cloud.device_id:
+                    if self.cloud.device_id:
+                        self.device_cloud._did = self.cloud.device_id
+                    elif self._mac:
+                        self.device_cloud.get_info(self._mac)
+
+            if not self.device_cloud.logged_in:
+                raise DeviceException("Unable to login to device over cloud") from None
+
+            send_batches = getattr(self.device_cloud, "send_batches", None)
+            if send_batches is not None:
+                results = send_batches("get_properties", batches, retry_count, timeout)
+                if results and all(result is None for result, _ in results):
+                    self._connected = False
+                    raise DeviceException("Unable to discover the device over cloud") from None
+                self._connected = True
+                return results
+
+        return [(self.get_properties(batch, retry_count, timeout), None) for batch in batches]
 
     def set_property(self, siid: int, piid: int, value: Any = None, retry_count: int = 2) -> Any:
         return self._set_properties(

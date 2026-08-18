@@ -10,7 +10,7 @@ from functools import cmp_to_key
 from datetime import datetime
 from random import randrange
 from threading import Timer
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 from .types import (
     PIID,
@@ -18,6 +18,7 @@ from .types import (
     DID,
     ACTION_AVAILABILITY,
     PROPERTY_AVAILABILITY,
+    CLOUD_CACHED_PROPERTIES,
     CONSUMABLE_PROPERTIES,
     DISCARDED_PROPERTIES,
     READ_ONLY_PROPERTIES,
@@ -300,6 +301,12 @@ from .map import DreameMapVacuumMapManager, DreameVacuumMapDecoder
 
 _LOGGER = logging.getLogger(__name__)
 
+# Properties per rpc call. Mi Home was captured using batches of 20 and 25 over its cloud, so
+# 25 is used there. The local miIO transport is a single UDP datagram with far less room, and
+# the Dreame cloud was never measured, so both keep the conservative size used until now.
+PROPERTY_CHUNK_SIZE_CLOUD: Final = 25
+PROPERTY_CHUNK_SIZE: Final = 15
+
 
 class DreameVacuumDevice:
     """Support for Dreame Vacuum"""
@@ -338,6 +345,12 @@ class DreameVacuumDevice:
         self._previous_cleangenius: int = None
         # Device do not request properties that returned -1 as result. This property used for overriding that behavior at first connection
         self._ready: bool = False
+        # Discovery (the first poll, which asks for every known property) must complete before
+        # the property list is narrowed down to what answered - a batch lost to a hiccup would
+        # otherwise drop those properties until the next restart.
+        self._discovery_incomplete: bool = False
+        # Properties the cloud serves from its cache; refined at runtime from net_cost.
+        self._cloud_cached_properties: set[int] = {prop.value for prop in CLOUD_CACHED_PROPERTIES}
         # Last settings properties requested time
         self._last_settings_request: float = 0
         self._last_map_list_request: float = 0  # Last map list property requested time
@@ -809,15 +822,96 @@ class DreameVacuumDevice:
                 if "aiid" not in mapping and (not self._ready or prop.value in self.data):
                     property_list.append({"did": str(prop.value), **mapping})
 
-        props = property_list.copy()
+        if not property_list:
+            return False
+
+        discovery = not self._ready
+        timeout = 10 if len(property_list) > PROPERTY_CHUNK_SIZE else None
         results = []
-        while props:
-            result = self._protocol.get_properties(props[:15], timeout=(10 if len(property_list) > 15 else None))
-            if result is not None:
+        # Empty batches are dropped before dispatch: the protocol filters them too, and a
+        # mismatch between what is sent and what comes back would misalign the results.
+        pending = [batch for batch in self._property_batches(property_list) if batch]
+
+        # Mi Home issues its property calls together instead of chaining them, so a poll costs
+        # one round trip rather than one per chunk. A batch that fails is not retried forever:
+        # the values it carries stay in memory and the next cycle asks for them again. Only
+        # during discovery is a loss permanent, so there the failed batches get one more try
+        # and an incomplete pass refuses to latch _ready.
+        for attempt in range(2 if discovery else 1):
+            if not pending:
+                break
+            if attempt:
+                _LOGGER.debug("Retrying %s property batch(es) of the discovery pass", len(pending))
+            failed = []
+            batch_results = self._protocol.get_properties_batches(pending, timeout=timeout)
+            for batch, (result, net_cost) in zip(pending, batch_results):
+                if result is None:
+                    failed.append(batch)
+                    continue
                 results.extend(result)
-                props[:] = props[15:]
+                self._learn_property_cost(batch, net_cost)
+            pending = failed
+
+        if pending:
+            lost = sum(len(batch) for batch in pending)
+            if discovery:
+                self._discovery_incomplete = True
+                _LOGGER.warning("Discovery incomplete: %s properties did not answer, retrying next cycle", lost)
+            else:
+                _LOGGER.debug("%s properties did not answer this cycle, keeping previous values", lost)
 
         return self._handle_properties(results)
+
+    @property
+    def _mi_home_rpc(self) -> bool:
+        """True when properties travel over the Mi Home cloud rpc tunnel.
+
+        Everything learned from the app applies to that transport only: the local miIO socket
+        has its own packet limits and the Dreame cloud was never measured, so both keep the
+        behaviour they had before.
+        """
+        protocol = self._protocol
+        return bool(
+            (protocol.prefer_cloud or not protocol.device) and protocol.device_cloud and not protocol.dreame_cloud
+        )
+
+    def _property_batches(self, property_list) -> list:
+        """Split properties into request batches, cloud-cached ones kept apart.
+
+        The cloud answers some properties from its own cache without waking the vacuum. Mixing
+        those with device-bound properties makes the whole batch wait for the robot, so they
+        travel in their own (effectively free) request, exactly as the app does it. Other
+        transports keep a single, plainly chunked list.
+        """
+        if not self._mi_home_rpc:
+            return [property_list[i : i + PROPERTY_CHUNK_SIZE] for i in range(0, len(property_list), PROPERTY_CHUNK_SIZE)]
+
+        cached, live = [], []
+        for item in property_list:
+            (cached if int(item["did"]) in self._cloud_cached_properties else live).append(item)
+
+        batches = []
+        for group in (cached, live):
+            for index in range(0, len(group), PROPERTY_CHUNK_SIZE_CLOUD):
+                batches.append(group[index : index + PROPERTY_CHUNK_SIZE_CLOUD])
+        return batches
+
+    def _learn_property_cost(self, batch, net_cost) -> None:
+        """Keep the cached/device split honest for this particular model.
+
+        net_cost is what the cloud reports for the call: zero means it never reached the
+        vacuum. A batch that was expected to be free but wasn't gets demoted, which at worst
+        returns the behaviour to a single device-bound request.
+        """
+        if net_cost is None:
+            return
+
+        dids = {int(item["did"]) for item in batch}
+        if net_cost == 0:
+            self._cloud_cached_properties.update(dids)
+        elif dids & self._cloud_cached_properties:
+            _LOGGER.debug("Properties answered by the device in %sms, no longer treated as cached", net_cost)
+            self._cloud_cached_properties.difference_update(dids)
 
     def _update_status(self, task_status: DreameVacuumTaskStatus, status: DreameVacuumStatus) -> None:
         """Update status properties on memory for map renderer to update the image before action is sent to the device."""
@@ -2450,7 +2544,13 @@ class DreameVacuumDevice:
                 self.available = True
 
             if not self._ready:
-                self._ready = True
+                # A discovery pass that lost a batch must not be latched: _request_properties
+                # narrows the polled list down to whatever answered, so the missing properties
+                # would stay missing until the next restart.
+                if self._discovery_incomplete:
+                    self._discovery_incomplete = False
+                else:
+                    self._ready = True
             else:
                 self._property_changed(False)
 
