@@ -1517,9 +1517,12 @@ class DreameVacuumMiHomeCloudProtocol:
         retries = 0
         if not retry_count or retry_count < 0:
             retry_count = 0
+        # Map objects are prefetched in parallel, so this can run on a worker thread; each
+        # one has to use its own session (see _request_session).
+        session = self._request_session()
         while retries < retry_count + 1:
             try:
-                response = self._session.get(url, timeout=10)
+                response = session.get(url, timeout=10)
             except Exception as ex:
                 response = None
                 _LOGGER.warning("Unable to get file at %s: %s", url, ex)

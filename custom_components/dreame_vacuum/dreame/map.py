@@ -12,6 +12,7 @@ import copy
 import numpy as np
 import hashlib
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from py_mini_racer import MiniRacer
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
@@ -177,6 +178,10 @@ class DreameMapVacuumMapManager:
         self._current_map_id: int = None
         self._current_timestamp_ms: int = None
         self._file_urls: dict[str, str] = {}
+        # Objects fetched ahead of time by _prefetch_object_files. Valid for the current
+        # update cycle only: the robot overwrites its map objects under the same name, so a
+        # body kept longer than the cycle that fetched it would show a stale map.
+        self._prefetched_files: dict[str, bytes] = {}
         self._saved_map_data: dict[int, MapData] = {}
         self._map_list: list[int] = []
         self._need_map_request: bool = False
@@ -578,6 +583,11 @@ class DreameMapVacuumMapManager:
             if object_name is None or object_name == "":
                 object_name = self._protocol.cloud.object_name
 
+            prefetched = self._prefetched_files.pop(object_name, None)
+            if prefetched is not None:
+                _LOGGER.debug("Using prefetched map object %s", object_name)
+                return prefetched
+
             url = self._get_file_url(object_name)
             if url:
                 _LOGGER.info("Request map data from cloud %s", url)
@@ -587,6 +597,70 @@ class DreameMapVacuumMapManager:
                 _LOGGER.warning("Request map data from cloud failed %s", url)
                 if self._file_urls.get(object_name):
                     del self._file_urls[object_name]
+
+    def _prefetch_object_files(self, object_names) -> None:
+        """Fetch several map objects at once instead of one after another.
+
+        The Mi Home app never chains these: opening a device fires the map list and the
+        current map together, so the pair costs one round trip rather than two. Each object
+        is a signed-url call plus a download, and both are pure latency (a few kB from the
+        Chinese storage takes over a second), which is what makes the overlap worth it.
+
+        Anything that fails here is simply not cached, and the normal sequential path fetches
+        it as before.
+        """
+        cloud = self._protocol.cloud
+        # Worker threads need their own requests.Session; the cloud protocol hands one out
+        # through this initializer. Without it every worker would share the main session,
+        # which is not thread safe - so no initializer means no prefetching.
+        init_session = getattr(cloud, "_init_worker_session", None)
+        names = [name for name in dict.fromkeys(object_names) if name and name not in self._prefetched_files]
+        if init_session is None or len(names) < 2:
+            return
+
+        def fetch(object_name):
+            try:
+                url = self._get_file_url(object_name)
+                return object_name, (cloud.get_file(url) if url else None)
+            except Exception as ex:  # noqa: BLE001 - a failed prefetch must not break the cycle
+                _LOGGER.debug("Prefetch of %s failed: %s", object_name, ex)
+                return object_name, None
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dreame-map", initializer=init_session) as executor:
+            for object_name, data in executor.map(fetch, names):
+                if data is not None:
+                    self._prefetched_files[object_name] = data
+
+    def _prefetch_pending_files(self) -> None:
+        """Objects this cycle is about to ask for, as far as they are known by name."""
+        cloud = self._protocol.cloud
+        if not cloud.logged_in or cloud.dreame_cloud:
+            return
+
+        names = []
+        if (self._map_list_object_name and self._need_map_list_request is None) or (
+            self._need_map_list_request and not self._device_running
+        ):
+            names.append(self._map_list_object_name)
+
+        if self._recovery_map_list_object_name and self._need_recovery_map_list_request:
+            names.append(self._recovery_map_list_object_name)
+
+        # On a cold start the current map is fetched too, but only when it comes from cloud
+        # storage - with _request_i_map_available the map is asked for over rpc and no file is
+        # downloaded at all, so prefetching one would be wasted every cycle. Its name is
+        # resolved from the cloud while fetching, so the best that can be done here is the
+        # default object, the same one the app reads. Should the resolved name differ, the
+        # prefetched body is simply never claimed and the normal path runs unchanged.
+        if (
+            self._map_data is None
+            and not self._request_i_map_available
+            and not self._need_new_map
+            and not self._need_map_request
+        ):
+            names.append(cloud.object_name)
+
+        self._prefetch_object_files(names)
 
     def _get_file_url(self, object_name: str, interim: bool = True) -> str | None:
         url = None
@@ -1443,6 +1517,8 @@ class DreameMapVacuumMapManager:
 
         _LOGGER.debug("Map update: %s", self._update_interval)
         try:
+            self._prefetch_pending_files()
+
             if (self._map_list_object_name and self._need_map_list_request is None) or (
                 self._need_map_list_request and not self._device_running
             ):
@@ -1524,6 +1600,9 @@ class DreameMapVacuumMapManager:
                 if self._error_callback:
                     self._error_callback(DeviceUpdateFailedException(ex))
 
+        # Whatever was prefetched but not claimed dies with the cycle that fetched it, so a
+        # map object can never be served from a body older than one update.
+        self._prefetched_files.clear()
         self._ready = True
         self._update_running = False
 
