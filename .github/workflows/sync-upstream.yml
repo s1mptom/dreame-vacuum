@@ -1,25 +1,31 @@
 name: sync-upstream
 
-# Keeps this fork's `dev` branch equal to "upstream dev + our patches" and publishes
+# Keeps this fork's `dev` branch equal to "upstream master + our patches" and publishes
 # a HACS-installable release whenever the integration actually changed.
+#
+# Upstream released 2.x from `dev` as betas until v2.0.0 (2026-09-30); then it squashed
+# `dev` into `master` and deleted `dev`. Its releases now come from `master`.
 #
 # Why a schedule and not a trigger on upstream commits: GitHub only delivers events
 # for THIS repo. Upstream (Tasshack/dreame-vacuum) is a different repo we don't own,
 # so we poll. A run that finds nothing new exits in a few seconds.
 #
-# Why merge and not "reset to upstream + re-apply patches with sed": our patch is a
-# real ~130-line change to dreame/protocol.py (silent passToken re-login + expired
-# serviceToken detection), not a substitution. A merge keeps it as history and tells
+# Why merge and not "reset to upstream + re-apply patches with sed": our patch is real
+# code, not a substitution - in dreame/protocol.py the passToken re-login fix (upstream's
+# login_step_3 hits CookieConflictError), the Mi Home app API (sid=mijia, api.mijia.tech),
+# replaying a request right after a token renewal and parallel rpc batches; in device.py,
+# map.py and types.py the cached/device property split and parallel map object fetches. A merge keeps it as history and tells
 # us honestly when upstream touches the same lines — that is exactly when a human
 # must look. On conflict the workflow aborts the merge, pushes nothing, and opens an
 # issue.
 #
-# Versioning: upstream ships v2.0.0bNN. We never reuse those tags — the repo manifest
+# Versioning: upstream ships v2.0.0 (earlier v2.0.0bNN betas). We never reuse those tags — the repo manifest
 # is kept byte-identical to upstream (so merges never conflict on the version line) and
 # the fork version is written into the release zip only. Two different shapes, because
 # the tag and the manifest are read by two consumers with incompatible rules:
 #
-#   tag       v2.0.0b25.N       AwesomeVersion calls this UNKNOWN, so HACS'
+#   tag       v2.0.0.N          SIMPLEVER: compared numerically, 2.0.1.1 > 2.0.0.9.
+#             v2.0.0b25.N       (beta upstream) AwesomeVersion calls this UNKNOWN, so HACS'
 #                               version_left_higher_then_right() returns None and
 #                               pending_update falls back to `installed != available`.
 #                               That fallback is what we want: it always notices a new
@@ -27,15 +33,15 @@ name: sync-upstream
 #                               AwesomeVersion evaluates 2.0.0b26.post1 > 2.0.0b25.post9
 #                               as False — after an upstream bump HACS would silently
 #                               stop offering updates.
-#   manifest  v2.0.0b25.postN   Home Assistant validates the manifest version and
+#   manifest  v2.0.0.postN      Home Assistant validates the manifest version and
 #                               refuses to load the integration otherwise ("does not
 #                               have a valid version key"). 4-segment betas are rejected;
 #                               .postN is valid PEP440. HACS never reads this field for
 #                               comparisons (installed_version is the tag), so the odd
 #                               ordering of .post carries no risk here.
 #
-# Releases are prereleases, matching upstream's 2.x betas — HACS only shows them with
-# "Show beta versions" enabled on the repository, and it never installs by itself.
+# A release is a prerelease exactly when upstream's version is (a/b/rc) — HACS only shows
+# those with "Show beta versions" enabled on the repository. It never installs by itself.
 
 on:
   schedule:
@@ -56,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UPSTREAM: https://github.com/Tasshack/dreame-vacuum.git
-      UPSTREAM_BRANCH: dev
+      UPSTREAM_BRANCH: master
       BRANCH: dev
       DOMAIN: dreame_vacuum
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,7 +98,7 @@ jobs:
             echo "::error::Merge conflict with upstream — nothing pushed."
             TITLE="Upstream sync conflict ($(date -u +%Y-%m-%d))"
             if ! gh issue list --state open --search "$TITLE in:title" --json title -q '.[].title' | grep -qF "$TITLE"; then
-              gh issue create --title "$TITLE" --body "$(printf 'Automatic merge of `upstream/%s` into `%s` hit a conflict, so nothing was pushed and no release was cut. This fork is still on its previous commit and HA keeps running the version it has.\n\nConflicting files:\n%s\n\nResolve locally:\n```\ngit fetch upstream %s\ngit checkout %s\ngit merge upstream/%s\n```\nOur patch lives in `custom_components/dreame_vacuum/dreame/protocol.py` (silent passToken re-login + SERVICETOKEN_EXPIRED detection). Once merged and pushed, run this workflow with `force_release` to publish.' "$UPSTREAM_BRANCH" "$BRANCH" "$CONFLICTS" "$UPSTREAM_BRANCH" "$BRANCH" "$UPSTREAM_BRANCH")"
+              gh issue create --title "$TITLE" --body "$(printf 'Automatic merge of `upstream/%s` into `%s` hit a conflict, so nothing was pushed and no release was cut. This fork is still on its previous commit and HA keeps running the version it has.\n\nConflicting files:\n%s\n\nResolve locally:\n```\ngit fetch upstream %s\ngit checkout %s\ngit merge upstream/%s\n```\nOur patch lives mostly in `custom_components/dreame_vacuum/dreame/protocol.py` (passToken re-login fix, Mi Home app API, token-renewal replay, parallel rpc batches) plus the property batching in `device.py` and map prefetch in `map.py`. Once merged and pushed, run this workflow with `force_release` to publish.' "$UPSTREAM_BRANCH" "$BRANCH" "$CONFLICTS" "$UPSTREAM_BRANCH" "$BRANCH" "$UPSTREAM_BRANCH")"
             fi
             exit 1
           fi
@@ -153,9 +159,12 @@ jobs:
           PY
           (cd build && zip -qr "../$DOMAIN.zip" .)
 
+          PRERELEASE=()
+          if [[ "$U" =~ [a-z] ]]; then PRERELEASE=(--prerelease); fi
+
           gh release create "$TAG" \
-            --prerelease \
+            "${PRERELEASE[@]}" \
             --target "$(git rev-parse HEAD)" \
             --title "$TAG" \
-            --notes "Fork of Tasshack/dreame-vacuum \`$U\` with the Mi Home cloud session fix (silent passToken re-login, expired serviceToken detected instead of looping). Built automatically by \`sync-upstream\`." \
+            --notes "Fork of Tasshack/dreame-vacuum \`$U\` with the Mi Home cloud fixes: working passToken re-login, the Mi Home app API, immediate replay after a token renewal and parallel property/map requests. Built automatically by \`sync-upstream\`." \
             "$DOMAIN.zip"
